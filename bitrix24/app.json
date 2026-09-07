@@ -1,0 +1,12 @@
+{
+  "version": "1",
+  "name": "Финансы проектов",
+  "description": "Доходы, расходы, прибыль и рентабельность проектов",
+  "url": "https://YOUR-DOMAIN.example/bitrix",
+  "installUrl": "https://YOUR-DOMAIN.example/bitrix/install",
+  "scope": ["user_basic", "user", "sonet_group"],
+  "placement": {
+    "placement": "DEFAULT",
+    "handler": "https://YOUR-DOMAIN.example/bitrix"
+  }
+}
