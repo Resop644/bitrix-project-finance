@@ -1,92 +1,59 @@
 # Bitrix24 Project Finance
 
-Веб-приложение для ручного учета доходов и расходов по проектам. Подходит для совместной работы сотрудников и может быть встроено в Bitrix24 как отдельное приложение.
+Веб-приложение для ручного учета доходов и расходов по проектам с интеграцией Bitrix24.
 
-## Что реализовано
+## Возможности
 
-- проекты и статусы проектов;
-- доходы и расходы по каждому проекту;
-- расчет доходов, расходов, прибыли и рентабельности;
-- стандартные статьи расходов:
-  - Внешние программисты;
-  - Внутренние программисты;
-  - Расходы на ИИ;
-  - Аренда сервера;
-  - Дивиденды;
-- добавление собственных статей доходов и расходов;
-- добавление сотрудников к проекту;
-- роли администратора, менеджера проекта и участника;
-- авторизация и сессии;
-- удаление/редактирование операций;
-- сводный экран по всем доступным проектам;
-- поле `bitrix_group_id` для связи проекта приложения с группой/проектом Bitrix24;
-- SQLite с WAL для простой установки и одновременной работы нескольких сотрудников;
-- адаптивный интерфейс.
+- доходы и расходы по проектам;
+- прибыль и рентабельность;
+- стандартные статьи: внешние программисты, внутренние программисты, ИИ, аренда сервера, дивиденды;
+- пользовательские статьи доходов и расходов;
+- сотрудники и роли проекта;
+- авторизация сотрудников;
+- Bitrix24 OAuth 2.0 и серверное хранение refresh/access token;
+- автоматическое определение текущего пользователя Bitrix24 через `user.current`;
+- получение проектов/групп Bitrix24 через `sonet_group.get`;
+- получение пользователей Bitrix24 через `user.get`;
+- синхронизация Bitrix24-групп с локальными проектами;
+- интерфейс `public/bitrix.html`, рассчитанный на запуск внутри iframe Bitrix24;
+- поле `bitrix_group_id` для устойчивого сопоставления проекта.
 
-## Запуск локально
+## Запуск
 
-Требуется Node.js 20+.
+Node.js 20+.
 
 ```bash
-npm install
-ADMIN_EMAIL=admin@example.com ADMIN_PASSWORD=change-me npm start
-```
-
-Windows PowerShell:
-
-```powershell
-$env:ADMIN_EMAIL="admin@example.com"
-$env:ADMIN_PASSWORD="change-me"
+cp .env.example .env
 npm install
 npm start
 ```
 
-Откройте `http://localhost:3000`.
+Для production обязательно задайте `ADMIN_PASSWORD`, `BITRIX_CLIENT_ID`, `BITRIX_CLIENT_SECRET` и длинный случайный `BITRIX_ENCRYPTION_KEY`.
 
-Если переменные не заданы, первый запуск использует `admin@example.com / admin123`. Для реальной установки пароль обязательно измените.
+## Подключение Bitrix24
 
-## Docker
+1. Разверните приложение на HTTPS-домене, доступном из Bitrix24.
+2. Создайте локальное/внешнее приложение Bitrix24 и укажите URL обработчика `https://YOUR-DOMAIN/bitrix`.
+3. В разрешениях приложения включите минимум `user_basic`, `user` и `sonet_group`.
+4. В переменных окружения сервера задайте `BITRIX_CLIENT_ID` и `BITRIX_CLIENT_SECRET`.
+5. URL установки/обработчика можно взять из `bitrix24/app.json`; замените `YOUR-DOMAIN` на фактический домен.
+6. После запуска приложения внутри Bitrix24 страница вызывает `BX24.getAuth()`, передает данные на `/api/bitrix/bootstrap`, а сервер сохраняет OAuth credentials зашифрованными.
+7. Refresh token обновляется сервером автоматически при истечении access token.
 
-```bash
-docker build -t bitrix-project-finance .
-docker run -p 3000:3000 -e ADMIN_EMAIL=admin@example.com -e ADMIN_PASSWORD=change-me -v finance-data:/app/data bitrix-project-finance
-```
+**Важно:** секрет приложения и refresh token не хранятся в браузере и не должны попадать в Git. В репозитории нет реальных credentials.
 
-Для Docker рекомендуется задать `DB_FILE=/app/data/finance.db`.
+## API Bitrix24
+
+- `POST /bitrix/install` — прием install/auth payload;
+- `POST /api/bitrix/bootstrap` — создание локальной сессии из `BX24.getAuth()`;
+- `GET /api/bitrix/context` — статус подключения;
+- `GET /api/bitrix/groups` — группы/проекты Bitrix24;
+- `GET /api/bitrix/users` — пользователи Bitrix24;
+- `POST /api/bitrix/sync-projects` — синхронизация групп в локальные проекты.
 
 ## Архитектура
 
 Backend: Node.js + Express + SQLite.
-Frontend: адаптивный SPA без тяжелого frontend build pipeline, чтобы приложение было максимально простым для сопровождения.
+Frontend: HTML/CSS/JS без обязательного build pipeline. Это упрощает поддержку и размещение в Bitrix24 iframe.
 
-API разделен по сущностям: auth, users, categories, projects, transactions и project members.
-
-## Bitrix24
-
-Приложение уже хранит `bitrix_group_id` у проекта, поэтому финансовый учет не зависит от структуры данных внутри Bitrix24. Следующим этапом можно подключить OAuth/REST Bitrix24 и автоматически:
-
-1. получать список групп/проектов;
-2. сопоставлять сотрудников Bitrix24 с локальными пользователями;
-3. открывать карточку финансов проекта непосредственно из Bitrix24;
-4. передавать ID проекта в приложение при открытии.
-
-REST/OAuth лучше подключать через серверный адаптер, не размещая секреты Bitrix24 в браузере.
-
-## Основные API
-
-- `POST /api/auth/login`
-- `GET /api/projects`
-- `POST /api/projects`
-- `GET /api/projects/:id`
-- `POST /api/projects/:id/transactions`
-- `PUT /api/transactions/:id`
-- `DELETE /api/transactions/:id`
-- `POST /api/projects/:id/members`
-- `GET /api/categories`
-- `POST /api/categories`
-- `GET /api/users`
-- `POST /api/users`
-
-## Важное для production
-
-Перед боевым размещением рекомендуется поставить HTTPS, вынести SQLite на PostgreSQL при высокой нагрузке, добавить CSRF-защиту/cookie-based auth или внешний identity provider, резервное копирование БД и полноценную Bitrix24 OAuth-интеграцию.
+Для high-load production рекомендуется PostgreSQL, HTTPS, reverse proxy, резервное копирование БД и централизованный identity provider.
