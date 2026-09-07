@@ -7,149 +7,75 @@ const app = express();
 const db = new Database(process.env.DB_FILE || 'finance.db');
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.json({limit:'1mb'}));
+app.use(express.urlencoded({extended:true}));
 
-function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
-  return `${salt}:${crypto.scryptSync(password, salt, 64).toString('hex')}`;
-}
-function verifyPassword(password, stored) {
-  const [salt, hash] = stored.split(':');
-  const derived = crypto.scryptSync(password, salt, 64).toString('hex');
-  return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(derived, 'hex'));
-}
-function token() { return crypto.randomBytes(32).toString('hex'); }
-function today() { return new Date().toISOString().slice(0, 10); }
-
-// Database
+function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) { return `${salt}:${crypto.scryptSync(password, salt, 64).toString('hex')}`; }
+function verifyPassword(password, stored) { const [salt, hash] = stored.split(':'); const derived = crypto.scryptSync(password, salt, 64).toString('hex'); return crypto.timingSafeEqual(Buffer.from(hash,'hex'), Buffer.from(derived,'hex')); }
+function token(){ return crypto.randomBytes(32).toString('hex'); }
+function today(){ return new Date().toISOString().slice(0,10); }
 
 db.exec(`
-CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'member', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, expires_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'member', bitrix_user_id TEXT DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, expires_at TEXT NOT NULL, bitrix_member_id TEXT DEFAULT '');
 CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'active', bitrix_group_id TEXT DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS project_members (project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, role TEXT NOT NULL DEFAULT 'member', PRIMARY KEY(project_id,user_id));
 CREATE TABLE IF NOT EXISTS categories (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL CHECK(type IN ('income','expense')), name TEXT NOT NULL, is_system INTEGER NOT NULL DEFAULT 0, UNIQUE(type,name));
 CREATE TABLE IF NOT EXISTS transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, type TEXT NOT NULL CHECK(type IN ('income','expense')), category_id INTEGER NOT NULL REFERENCES categories(id), amount REAL NOT NULL CHECK(amount > 0), transaction_date TEXT NOT NULL, description TEXT DEFAULT '', created_by INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS bitrix_connections (member_id TEXT PRIMARY KEY, domain TEXT NOT NULL, access_token TEXT NOT NULL, refresh_token TEXT NOT NULL, expires_at INTEGER NOT NULL, client_endpoint TEXT NOT NULL, application_token TEXT DEFAULT '', scope TEXT DEFAULT '', bitrix_user_id TEXT DEFAULT '', updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 `);
+try{db.exec("ALTER TABLE users ADD COLUMN bitrix_user_id TEXT DEFAULT ''");}catch(e){}
+try{db.exec("ALTER TABLE sessions ADD COLUMN bitrix_member_id TEXT DEFAULT ''");}catch(e){}
 
-const defaults = [
-  ['income','Основной доход',1],
-  ['expense','Внешние программисты',1],
-  ['expense','Внутренние программисты',1],
-  ['expense','Расходы на ИИ',1],
-  ['expense','Аренда сервера',1],
-  ['expense','Дивиденды',1]
-];
-const addCat = db.prepare('INSERT OR IGNORE INTO categories(type,name,is_system) VALUES(?,?,?)');
-for (const c of defaults) addCat.run(...c);
-if (db.prepare('SELECT COUNT(*) c FROM users').get().c === 0) {
-  const email = process.env.ADMIN_EMAIL || 'admin@example.com';
-  const password = process.env.ADMIN_PASSWORD || 'admin123';
-  db.prepare('INSERT INTO users(name,email,password_hash,role) VALUES(?,?,?,?)').run('Администратор', email, hashPassword(password), 'admin');
-}
+const defaults=[['income','Основной доход',1],['expense','Внешние программисты',1],['expense','Внутренние программисты',1],['expense','Расходы на ИИ',1],['expense','Аренда сервера',1],['expense','Дивиденды',1]];
+const addCat=db.prepare('INSERT OR IGNORE INTO categories(type,name,is_system) VALUES(?,?,?)'); for(const c of defaults)addCat.run(...c);
+if(db.prepare('SELECT COUNT(*) c FROM users').get().c===0){const email=process.env.ADMIN_EMAIL||'admin@example.com';const password=process.env.ADMIN_PASSWORD||'admin123';db.prepare('INSERT INTO users(name,email,password_hash,role) VALUES(?,?,?,?)').run('Администратор',email,hashPassword(password),'admin');}
 
-function auth(req,res,next){
-  const t = req.headers.authorization?.replace('Bearer ','');
-  if(!t) return res.status(401).json({error:'Требуется авторизация'});
-  const s = db.prepare(`SELECT u.*, s.expires_at FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=?`).get(t);
-  if(!s || new Date(s.expires_at) < new Date()) return res.status(401).json({error:'Сессия истекла'});
-  req.user=s; req.token=t; next();
-}
-function canProject(user, projectId){
-  if(user.role==='admin') return true;
-  return !!db.prepare('SELECT 1 FROM project_members WHERE project_id=? AND user_id=?').get(projectId,user.id);
-}
-function canManageProject(user, projectId){
-  if(user.role==='admin') return true;
-  return !!db.prepare("SELECT 1 FROM project_members WHERE project_id=? AND user_id=? AND role='manager'").get(projectId,user.id);
-}
+function auth(req,res,next){const t=req.headers.authorization?.replace('Bearer ','');if(!t)return res.status(401).json({error:'Требуется авторизация'});const s=db.prepare('SELECT u.*,s.expires_at,s.bitrix_member_id FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=?').get(t);if(!s||new Date(s.expires_at)<new Date())return res.status(401).json({error:'Сессия истекла'});req.user=s;req.token=t;next();}
+function canProject(user,id){if(user.role==='admin')return true;return !!db.prepare('SELECT 1 FROM project_members WHERE project_id=? AND user_id=?').get(id,user.id);}
+function canManageProject(user,id){if(user.role==='admin')return true;return !!db.prepare("SELECT 1 FROM project_members WHERE project_id=? AND user_id=? AND role='manager'").get(id,user.id);}
 
-app.post('/api/auth/login',(req,res)=>{
-  const {email,password}=req.body||{};
-  const u=db.prepare('SELECT * FROM users WHERE lower(email)=lower(?)').get(String(email||'').trim());
-  if(!u || !verifyPassword(String(password||''),u.password_hash)) return res.status(401).json({error:'Неверный email или пароль'});
-  const t=token(), expires=new Date(Date.now()+1000*60*60*24*7).toISOString();
-  db.prepare('INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)').run(t,u.id,expires);
-  res.json({token:t,user:{id:u.id,name:u.name,email:u.email,role:u.role}});
-});
+// Bitrix24 OAuth 2.0. Client secret is server-only; refresh tokens are encrypted at rest.
+const BITRIX_CLIENT_ID=process.env.BITRIX_CLIENT_ID||'';
+const BITRIX_CLIENT_SECRET=process.env.BITRIX_CLIENT_SECRET||'';
+const ENC_KEY=crypto.createHash('sha256').update(process.env.BITRIX_ENCRYPTION_KEY||'change-this-in-production').digest();
+function encrypt(value){const iv=crypto.randomBytes(12);const c=crypto.createCipheriv('aes-256-gcm',ENC_KEY,iv);const data=Buffer.concat([c.update(String(value),'utf8'),c.final()]);return [iv.toString('base64'),c.getAuthTag().toString('base64'),data.toString('base64')].join('.');}
+function decrypt(value){try{const [iv,tag,data]=String(value).split('.');const d=crypto.createDecipheriv('aes-256-gcm',ENC_KEY,Buffer.from(iv,'base64'));d.setAuthTag(Buffer.from(tag,'base64'));return Buffer.concat([d.update(Buffer.from(data,'base64')),d.final()]).toString('utf8');}catch(e){return '';}}
+async function refreshBitrix(conn){if(!BITRIX_CLIENT_ID||!BITRIX_CLIENT_SECRET)throw new Error('BITRIX_CLIENT_ID / BITRIX_CLIENT_SECRET не настроены');const refresh=decrypt(conn.refresh_token);const url=new URL('https://oauth.bitrix.info/oauth/token/');url.search=new URLSearchParams({grant_type:'refresh_token',client_id:BITRIX_CLIENT_ID,client_secret:BITRIX_CLIENT_SECRET,refresh_token:refresh}).toString();const r=await fetch(url);const data=await r.json();if(!r.ok||data.error)throw new Error(data.error_description||data.error||'Bitrix OAuth refresh failed');db.prepare('UPDATE bitrix_connections SET access_token=?,refresh_token=?,expires_at=?,client_endpoint=?,updated_at=CURRENT_TIMESTAMP WHERE member_id=?').run(encrypt(data.access_token),encrypt(data.refresh_token||refresh),Date.now()+Number(data.expires_in||3600)*1000,data.client_endpoint||conn.client_endpoint,conn.member_id);return db.prepare('SELECT * FROM bitrix_connections WHERE member_id=?').get(conn.member_id);}
+async function bitrixRequest(memberId,method,params={}){let conn=db.prepare('SELECT * FROM bitrix_connections WHERE member_id=?').get(memberId);if(!conn)throw new Error('Bitrix24 портал не подключен');let access=decrypt(conn.access_token);const call=async()=>{const r=await fetch(conn.client_endpoint.replace(/\/$/,'/')+method+'.json',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...params,auth:access})});return {status:r.status,data:await r.json()};};let out=await call();if(out.status===401||out.data?.error==='expired_token'){conn=await refreshBitrix(conn);access=decrypt(conn.access_token);out=await call();}if(out.data?.error)throw new Error(out.data.error_description||out.data.error);return out.data.result;}
+function saveBitrixAuth(a){const memberId=a.member_id||a.MEMBER_ID;if(!memberId||!a.domain||!(a.access_token||a.AUTH_ID))throw new Error('Bitrix24 authorization data is incomplete');const access=a.access_token||a.AUTH_ID,refresh=a.refresh_token||a.REFRESH_ID;if(!refresh)throw new Error('Bitrix24 refresh token is missing');db.prepare(`INSERT INTO bitrix_connections(member_id,domain,access_token,refresh_token,expires_at,client_endpoint,application_token,scope,bitrix_user_id) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(member_id) DO UPDATE SET domain=excluded.domain,access_token=excluded.access_token,refresh_token=excluded.refresh_token,expires_at=excluded.expires_at,client_endpoint=excluded.client_endpoint,application_token=excluded.application_token,scope=excluded.scope,updated_at=CURRENT_TIMESTAMP`).run(memberId,a.domain,encrypt(access),encrypt(refresh),Date.now()+Number(a.expires_in||a.AUTH_EXPIRES||3600)*1000,a.client_endpoint||`https://${a.domain}/rest/`,a.application_token||a.APPLICATION_TOKEN||'',a.scope||a.APPLICATION_SCOPE||'',a.user_id||'');return memberId;}
+
+// Installation callback required by a server-side local Bitrix24 application.
+app.post('/bitrix/install',(req,res)=>{try{saveBitrixAuth(req.body.auth||req.body);res.json({status:'success'});}catch(e){res.status(400).json({error:e.message});}});
+app.get('/bitrix',(req,res)=>res.sendFile(path.join(__dirname,'public','bitrix.html')));
+
+// Convert BX24.getAuth() data into an application session.
+app.post('/api/bitrix/bootstrap',async(req,res)=>{try{const a=req.body||{};const memberId=saveBitrixAuth(a);const buser=await bitrixRequest(memberId,'user.current');const email=(buser.EMAIL||`${buser.ID}@bitrix.local`).toLowerCase();let u=db.prepare('SELECT * FROM users WHERE bitrix_user_id=?').get(String(buser.ID));if(!u)u=db.prepare('SELECT * FROM users WHERE lower(email)=lower(?)').get(email);if(!u){const role=buser.ADMIN==='Y'?'admin':'member';const r=db.prepare('INSERT INTO users(name,email,password_hash,role,bitrix_user_id) VALUES(?,?,?,?,?)').run(`${buser.NAME||''} ${buser.LAST_NAME||''}`.trim()||`Bitrix user ${buser.ID}`,email,hashPassword(crypto.randomBytes(24).toString('hex')),role,String(buser.ID));u=db.prepare('SELECT * FROM users WHERE id=?').get(r.lastInsertRowid);}else{db.prepare('UPDATE users SET bitrix_user_id=?,name=? WHERE id=?').run(String(buser.ID),`${buser.NAME||''} ${buser.LAST_NAME||''}`.trim()||u.name,u.id);u=db.prepare('SELECT * FROM users WHERE id=?').get(u.id);}const t=token();db.prepare('INSERT INTO sessions(token,user_id,expires_at,bitrix_member_id) VALUES(?,?,?,?)').run(t,u.id,new Date(Date.now()+1000*60*60*12).toISOString(),memberId);res.json({token:t,user:{id:u.id,name:u.name,email:u.email,role:u.role,bitrix_user_id:String(buser.ID)},bitrix:{member_id:memberId,domain:a.domain,scope:a.scope||a.APPLICATION_SCOPE||''}});}catch(e){res.status(400).json({error:e.message});}});
+app.get('/api/bitrix/context',auth,(req,res)=>{const c=req.user.bitrix_member_id?db.prepare('SELECT member_id,domain,scope,expires_at FROM bitrix_connections WHERE member_id=?').get(req.user.bitrix_member_id):null;res.json({connected:!!c,connection:c||null});});
+app.get('/api/bitrix/groups',auth,async(req,res)=>{try{if(!req.user.bitrix_member_id)return res.status(400).json({error:'Bitrix24 не подключен'});res.json(await bitrixRequest(req.user.bitrix_member_id,'sonet_group.get',{ORDER:{NAME:'ASC'},FILTER:{ACTIVE:'Y'}})||[]);}catch(e){res.status(400).json({error:e.message});}});
+app.get('/api/bitrix/users',auth,async(req,res)=>{try{if(!req.user.bitrix_member_id)return res.status(400).json({error:'Bitrix24 не подключен'});res.json(await bitrixRequest(req.user.bitrix_member_id,'user.get',{SORT:'NAME',ORDER:'ASC',select:['ID','NAME','LAST_NAME','EMAIL','PERSONAL_PHOTO','WORK_POSITION'],start:0})||[]);}catch(e){res.status(400).json({error:e.message});}});
+app.post('/api/bitrix/sync-projects',auth,async(req,res)=>{try{if(!req.user.bitrix_member_id)return res.status(400).json({error:'Bitrix24 не подключен'});const groups=await bitrixRequest(req.user.bitrix_member_id,'sonet_group.get',{ORDER:{NAME:'ASC'},FILTER:{ACTIVE:'Y'}})||[];const sync=db.transaction(()=>{for(const g of groups){const existing=db.prepare('SELECT id FROM projects WHERE bitrix_group_id=?').get(String(g.ID));if(existing){db.prepare('UPDATE projects SET name=?,description=?,status=? WHERE id=?').run(g.NAME||`Проект ${g.ID}`,g.DESCRIPTION||'',g.CLOSED==='Y'?'archived':'active',existing.id);db.prepare('INSERT OR IGNORE INTO project_members(project_id,user_id,role) VALUES(?,?,?)').run(existing.id,req.user.id,'manager');}else{const r=db.prepare('INSERT INTO projects(name,description,status,bitrix_group_id) VALUES(?,?,?,?)').run(g.NAME||`Проект ${g.ID}`,g.DESCRIPTION||'',g.CLOSED==='Y'?'archived':'active',String(g.ID));db.prepare('INSERT OR IGNORE INTO project_members(project_id,user_id,role) VALUES(?,?,?)').run(r.lastInsertRowid,req.user.id,'manager');}}});sync();res.json({synced:groups.length});}catch(e){res.status(400).json({error:e.message});}});
+
+// Finance API
+app.post('/api/auth/login',(req,res)=>{const {email,password}=req.body||{};const u=db.prepare('SELECT * FROM users WHERE lower(email)=lower(?)').get(String(email||'').trim());if(!u||!verifyPassword(String(password||''),u.password_hash))return res.status(401).json({error:'Неверный email или пароль'});const t=token();db.prepare('INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)').run(t,u.id,new Date(Date.now()+1000*60*60*24*7).toISOString());res.json({token:t,user:{id:u.id,name:u.name,email:u.email,role:u.role}});});
 app.post('/api/auth/logout',auth,(req,res)=>{db.prepare('DELETE FROM sessions WHERE token=?').run(req.token);res.json({ok:true});});
-app.get('/api/me',auth,(req,res)=>res.json({id:req.user.id,name:req.user.name,email:req.user.email,role:req.user.role}));
-
-app.get('/api/users',auth,(req,res)=>res.json(db.prepare('SELECT id,name,email,role FROM users ORDER BY name').all()));
-app.post('/api/users',auth,(req,res)=>{
-  if(req.user.role!=='admin') return res.status(403).json({error:'Только администратор может добавлять сотрудников'});
-  const {name,email,password,role='member'}=req.body||{};
-  if(!name||!email||!password) return res.status(400).json({error:'Заполните имя, email и пароль'});
-  try{const r=db.prepare('INSERT INTO users(name,email,password_hash,role) VALUES(?,?,?,?)').run(name.trim(),email.trim(),hashPassword(password),role==='admin'?'admin':'member');res.json({id:r.lastInsertRowid});}
-  catch(e){res.status(400).json({error:'Пользователь с таким email уже существует'});}
-});
-
+app.get('/api/me',auth,(req,res)=>res.json({id:req.user.id,name:req.user.name,email:req.user.email,role:req.user.role,bitrix_user_id:req.user.bitrix_user_id||''}));
+app.get('/api/users',auth,(req,res)=>res.json(db.prepare('SELECT id,name,email,role,bitrix_user_id FROM users ORDER BY name').all()));
+app.post('/api/users',auth,(req,res)=>{if(req.user.role!=='admin')return res.status(403).json({error:'Только администратор может добавлять сотрудников'});const {name,email,password,role='member'}=req.body||{};if(!name||!email||!password)return res.status(400).json({error:'Заполните имя, email и пароль'});try{const r=db.prepare('INSERT INTO users(name,email,password_hash,role) VALUES(?,?,?,?)').run(name.trim(),email.trim(),hashPassword(password),role==='admin'?'admin':'member');res.json({id:r.lastInsertRowid});}catch(e){res.status(400).json({error:'Пользователь с таким email уже существует'});}});
 app.get('/api/categories',auth,(req,res)=>res.json(db.prepare('SELECT * FROM categories ORDER BY type,name').all()));
-app.post('/api/categories',auth,(req,res)=>{
-  if(req.user.role!=='admin') return res.status(403).json({error:'Добавлять статьи может только администратор'});
-  const {type,name}=req.body||{};
-  if(!['income','expense'].includes(type)||!name?.trim()) return res.status(400).json({error:'Некорректная статья'});
-  try{const r=db.prepare('INSERT INTO categories(type,name) VALUES(?,?)').run(type,name.trim());res.json({id:r.lastInsertRowid});}
-  catch(e){res.status(400).json({error:'Такая статья уже существует'});}
-});
+app.post('/api/categories',auth,(req,res)=>{if(req.user.role!=='admin')return res.status(403).json({error:'Добавлять статьи может только администратор'});const {type,name}=req.body||{};if(!['income','expense'].includes(type)||!name?.trim())return res.status(400).json({error:'Некорректная статья'});try{const r=db.prepare('INSERT INTO categories(type,name) VALUES(?,?)').run(type,name.trim());res.json({id:r.lastInsertRowid});}catch(e){res.status(400).json({error:'Такая статья уже существует'});}});
+app.get('/api/projects',auth,(req,res)=>{const where=req.user.role==='admin'?'':'JOIN project_members pm ON pm.project_id=p.id WHERE pm.user_id=?';const params=req.user.role==='admin'?[]:[req.user.id];const rows=db.prepare(`SELECT p.*,COALESCE((SELECT SUM(amount) FROM transactions t WHERE t.project_id=p.id AND t.type='income'),0) income,COALESCE((SELECT SUM(amount) FROM transactions t WHERE t.project_id=p.id AND t.type='expense'),0) expense FROM projects p ${where} ORDER BY p.created_at DESC`).all(...params);res.json(rows.map(p=>({...p,profit:p.income-p.expense,margin:p.income?(p.income-p.expense)/p.income*100:0})));});
+app.post('/api/projects',auth,(req,res)=>{const {name,description='',status='active',bitrix_group_id=''}=req.body||{};if(!name?.trim())return res.status(400).json({error:'Название проекта обязательно'});const r=db.prepare('INSERT INTO projects(name,description,status,bitrix_group_id) VALUES(?,?,?,?)').run(name.trim(),description,status,bitrix_group_id);db.prepare('INSERT INTO project_members(project_id,user_id,role) VALUES(?,?,?)').run(r.lastInsertRowid,req.user.id,'manager');res.json({id:r.lastInsertRowid});});
+app.put('/api/projects/:id',auth,(req,res)=>{const id=Number(req.params.id);if(!canManageProject(req.user,id))return res.status(403).json({error:'Нет прав'});const {name,description='',status='active',bitrix_group_id=''}=req.body||{};db.prepare('UPDATE projects SET name=?,description=?,status=?,bitrix_group_id=? WHERE id=?').run(name.trim(),description,status,bitrix_group_id,id);res.json({ok:true});});
+app.delete('/api/projects/:id',auth,(req,res)=>{if(req.user.role!=='admin')return res.status(403).json({error:'Удалять проекты может только администратор'});db.prepare('DELETE FROM projects WHERE id=?').run(Number(req.params.id));res.json({ok:true});});
+app.get('/api/projects/:id',auth,(req,res)=>{const id=Number(req.params.id);if(!canProject(req.user,id))return res.status(403).json({error:'Нет доступа'});const project=db.prepare('SELECT * FROM projects WHERE id=?').get(id);if(!project)return res.status(404).json({error:'Проект не найден'});const income=db.prepare("SELECT COALESCE(SUM(amount),0) v FROM transactions WHERE project_id=? AND type='income'").get(id).v;const expense=db.prepare("SELECT COALESCE(SUM(amount),0) v FROM transactions WHERE project_id=? AND type='expense'").get(id).v;const transactions=db.prepare(`SELECT t.*,c.name category,u.name created_by_name FROM transactions t JOIN categories c ON c.id=t.category_id JOIN users u ON u.id=t.created_by WHERE t.project_id=? ORDER BY transaction_date DESC,t.id DESC`).all(id);const members=db.prepare(`SELECT u.id,u.name,u.email,pm.role FROM project_members pm JOIN users u ON u.id=pm.user_id WHERE pm.project_id=? ORDER BY u.name`).all(id);const breakdown=db.prepare(`SELECT c.name,SUM(t.amount) amount FROM transactions t JOIN categories c ON c.id=t.category_id WHERE t.project_id=? AND t.type='expense' GROUP BY c.id ORDER BY amount DESC`).all(id);res.json({...project,metrics:{income,expense,profit:income-expense,margin:income?(income-expense)/income*100:0},transactions,members,breakdown});});
+app.post('/api/projects/:id/transactions',auth,(req,res)=>{const projectId=Number(req.params.id);if(!canProject(req.user,projectId))return res.status(403).json({error:'Нет доступа'});const {type,category_id,amount,transaction_date=today(),description=''}=req.body||{};if(!['income','expense'].includes(type)||!Number(category_id)||!(Number(amount)>0))return res.status(400).json({error:'Проверьте тип, статью и сумму'});const cat=db.prepare('SELECT * FROM categories WHERE id=? AND type=?').get(category_id,type);if(!cat)return res.status(400).json({error:'Статья не соответствует типу операции'});const r=db.prepare('INSERT INTO transactions(project_id,type,category_id,amount,transaction_date,description,created_by) VALUES(?,?,?,?,?,?,?)').run(projectId,type,category_id,Number(amount),transaction_date,description,req.user.id);res.json({id:r.lastInsertRowid});});
+app.put('/api/transactions/:id',auth,(req,res)=>{const t=db.prepare('SELECT * FROM transactions WHERE id=?').get(Number(req.params.id));if(!t||!canProject(req.user,t.project_id))return res.status(403).json({error:'Нет доступа'});const {type,category_id,amount,transaction_date,description=''}=req.body||{};if(!['income','expense'].includes(type)||!(Number(amount)>0))return res.status(400).json({error:'Некорректные данные'});db.prepare('UPDATE transactions SET type=?,category_id=?,amount=?,transaction_date=?,description=? WHERE id=?').run(type,category_id,Number(amount),transaction_date,description,t.id);res.json({ok:true});});
+app.delete('/api/transactions/:id',auth,(req,res)=>{const t=db.prepare('SELECT * FROM transactions WHERE id=?').get(Number(req.params.id));if(!t||!canProject(req.user,t.project_id))return res.status(403).json({error:'Нет доступа'});db.prepare('DELETE FROM transactions WHERE id=?').run(t.id);res.json({ok:true});});
+app.post('/api/projects/:id/members',auth,(req,res)=>{const projectId=Number(req.params.id);if(!canManageProject(req.user,projectId))return res.status(403).json({error:'Нет прав'});const {user_id,role='member'}=req.body||{};if(!db.prepare('SELECT 1 FROM users WHERE id=?').get(user_id))return res.status(400).json({error:'Сотрудник не найден'});try{db.prepare('INSERT INTO project_members(project_id,user_id,role) VALUES(?,?,?)').run(projectId,user_id,role==='manager'?'manager':'member');res.json({ok:true});}catch(e){res.status(400).json({error:'Сотрудник уже добавлен'});}});
+app.delete('/api/projects/:id/members/:userId',auth,(req,res)=>{const projectId=Number(req.params.id);if(!canManageProject(req.user,projectId))return res.status(403).json({error:'Нет прав'});db.prepare('DELETE FROM project_members WHERE project_id=? AND user_id=?').run(projectId,Number(req.params.userId));res.json({ok:true});});
+app.get('/api/dashboard',auth,(req,res)=>{const projects=req.user.role==='admin'?db.prepare('SELECT id FROM projects').all():db.prepare('SELECT project_id id FROM project_members WHERE user_id=?').all(req.user.id);const ids=projects.map(x=>x.id);if(!ids.length)return res.json({projects:0,income:0,expense:0,profit:0,margin:0});const q=ids.map(()=>'?').join(',');const x=db.prepare(`SELECT COALESCE(SUM(CASE WHEN type='income' THEN amount ELSE 0 END),0) income,COALESCE(SUM(CASE WHEN type='expense' THEN amount ELSE 0 END),0) expense FROM transactions WHERE project_id IN (${q})`).get(...ids);res.json({projects:ids.length,...x,profit:x.income-x.expense,margin:x.income?(x.income-x.expense)/x.income*100:0});});
 
-app.get('/api/projects',auth,(req,res)=>{
-  const where=req.user.role==='admin'?'':'JOIN project_members pm ON pm.project_id=p.id WHERE pm.user_id=?';
-  const params=req.user.role==='admin'?[]:[req.user.id];
-  const rows=db.prepare(`SELECT p.*, COALESCE((SELECT SUM(amount) FROM transactions t WHERE t.project_id=p.id AND t.type='income'),0) income, COALESCE((SELECT SUM(amount) FROM transactions t WHERE t.project_id=p.id AND t.type='expense'),0) expense FROM projects p ${where} ORDER BY p.created_at DESC`).all(...params);
-  res.json(rows.map(p=>({...p,profit:p.income-p.expense,margin:p.income?p.profit/p.income*100:0})));
-});
-app.post('/api/projects',auth,(req,res)=>{
-  const {name,description='',status='active',bitrix_group_id=''}=req.body||{};
-  if(!name?.trim()) return res.status(400).json({error:'Название проекта обязательно'});
-  const r=db.prepare('INSERT INTO projects(name,description,status,bitrix_group_id) VALUES(?,?,?,?)').run(name.trim(),description,status,bitrix_group_id);
-  db.prepare('INSERT INTO project_members(project_id,user_id,role) VALUES(?,?,?)').run(r.lastInsertRowid,req.user.id,'manager');
-  res.json({id:r.lastInsertRowid});
-});
-app.put('/api/projects/:id',auth,(req,res)=>{
-  const id=Number(req.params.id); if(!canManageProject(req.user,id)) return res.status(403).json({error:'Нет прав'});
-  const {name,description='',status='active',bitrix_group_id=''}=req.body||{};
-  db.prepare('UPDATE projects SET name=?,description=?,status=?,bitrix_group_id=? WHERE id=?').run(name.trim(),description,status,bitrix_group_id,id);res.json({ok:true});
-});
-app.delete('/api/projects/:id',auth,(req,res)=>{if(req.user.role!=='admin') return res.status(403).json({error:'Удалять проекты может только администратор'});db.prepare('DELETE FROM projects WHERE id=?').run(Number(req.params.id));res.json({ok:true});});
-
-app.get('/api/projects/:id',auth,(req,res)=>{
-  const id=Number(req.params.id); if(!canProject(req.user,id)) return res.status(403).json({error:'Нет доступа'});
-  const project=db.prepare('SELECT * FROM projects WHERE id=?').get(id); if(!project) return res.status(404).json({error:'Проект не найден'});
-  const income=db.prepare("SELECT COALESCE(SUM(amount),0) v FROM transactions WHERE project_id=? AND type='income'").get(id).v;
-  const expense=db.prepare("SELECT COALESCE(SUM(amount),0) v FROM transactions WHERE project_id=? AND type='expense'").get(id).v;
-  const transactions=db.prepare(`SELECT t.*,c.name category,u.name created_by_name FROM transactions t JOIN categories c ON c.id=t.category_id JOIN users u ON u.id=t.created_by WHERE t.project_id=? ORDER BY transaction_date DESC,t.id DESC`).all(id);
-  const members=db.prepare(`SELECT u.id,u.name,u.email,pm.role FROM project_members pm JOIN users u ON u.id=pm.user_id WHERE pm.project_id=? ORDER BY u.name`).all(id);
-  const breakdown=db.prepare(`SELECT c.name,SUM(t.amount) amount FROM transactions t JOIN categories c ON c.id=t.category_id WHERE t.project_id=? AND t.type='expense' GROUP BY c.id ORDER BY amount DESC`).all(id);
-  res.json({...project,metrics:{income,expense,profit:income-expense,margin:income?(income-expense)/income*100:0},transactions,members,breakdown});
-});
-
-app.post('/api/projects/:id/transactions',auth,(req,res)=>{
-  const projectId=Number(req.params.id); if(!canProject(req.user,projectId)) return res.status(403).json({error:'Нет доступа'});
-  const {type,category_id,amount,transaction_date=today(),description=''}=req.body||{};
-  if(!['income','expense'].includes(type)||!Number(category_id)||!(Number(amount)>0)) return res.status(400).json({error:'Проверьте тип, статью и сумму'});
-  const cat=db.prepare('SELECT * FROM categories WHERE id=? AND type=?').get(category_id,type); if(!cat) return res.status(400).json({error:'Статья не соответствует типу операции'});
-  const r=db.prepare('INSERT INTO transactions(project_id,type,category_id,amount,transaction_date,description,created_by) VALUES(?,?,?,?,?,?,?)').run(projectId,type,category_id,Number(amount),transaction_date,description,req.user.id);res.json({id:r.lastInsertRowid});
-});
-app.put('/api/transactions/:id',auth,(req,res)=>{
-  const t=db.prepare('SELECT * FROM transactions WHERE id=?').get(Number(req.params.id)); if(!t||!canProject(req.user,t.project_id)) return res.status(403).json({error:'Нет доступа'});
-  const {type,category_id,amount,transaction_date,description=''}=req.body||{};
-  if(!['income','expense'].includes(type)||!(Number(amount)>0)) return res.status(400).json({error:'Некорректные данные'});
-  db.prepare('UPDATE transactions SET type=?,category_id=?,amount=?,transaction_date=?,description=? WHERE id=?').run(type,category_id,Number(amount),transaction_date,description,t.id);res.json({ok:true});
-});
-app.delete('/api/transactions/:id',auth,(req,res)=>{const t=db.prepare('SELECT * FROM transactions WHERE id=?').get(Number(req.params.id));if(!t||!canProject(req.user,t.project_id)) return res.status(403).json({error:'Нет доступа'});db.prepare('DELETE FROM transactions WHERE id=?').run(t.id);res.json({ok:true});});
-
-app.post('/api/projects/:id/members',auth,(req,res)=>{const projectId=Number(req.params.id);if(!canManageProject(req.user,projectId)) return res.status(403).json({error:'Нет прав'});const {user_id,role='member'}=req.body||{};if(!db.prepare('SELECT 1 FROM users WHERE id=?').get(user_id)) return res.status(400).json({error:'Сотрудник не найден'});try{db.prepare('INSERT INTO project_members(project_id,user_id,role) VALUES(?,?,?)').run(projectId,user_id,role==='manager'?'manager':'member');res.json({ok:true});}catch(e){res.status(400).json({error:'Сотрудник уже добавлен'});}});
-app.delete('/api/projects/:id/members/:userId',auth,(req,res)=>{const projectId=Number(req.params.id);if(!canManageProject(req.user,projectId)) return res.status(403).json({error:'Нет прав'});db.prepare('DELETE FROM project_members WHERE project_id=? AND user_id=?').run(projectId,Number(req.params.userId));res.json({ok:true});});
-
-app.get('/api/dashboard',auth,(req,res)=>{
-  const projects=req.user.role==='admin'?db.prepare('SELECT id FROM projects').all():db.prepare('SELECT project_id id FROM project_members WHERE user_id=?').all(req.user.id);
-  const ids=projects.map(x=>x.id); if(!ids.length) return res.json({projects:0,income:0,expense:0,profit:0,margin:0});
-  const q=ids.map(()=>'?').join(','); const x=db.prepare(`SELECT COALESCE(SUM(CASE WHEN type='income' THEN amount ELSE 0 END),0) income,COALESCE(SUM(CASE WHEN type='expense' THEN amount ELSE 0 END),0) expense FROM transactions WHERE project_id IN (${q})`).get(...ids);res.json({projects:ids.length,...x,profit:x.income-x.expense,margin:x.income?(x.income-x.expense)/x.income*100:0});
-});
-
-app.get('/api/bitrix24/status',auth,(req,res)=>res.json({configured:Boolean(process.env.BITRIX24_WEBHOOK_URL),message:'Bitrix24 adapter предусмотрен; привязка групп/проектов выполняется через bitrix_group_id.'}));
-
+app.use(express.static(path.join(__dirname,'public')));
 app.get('*',(req,res)=>res.sendFile(path.join(__dirname,'public','index.html')));
-const PORT=process.env.PORT||3000;
-app.listen(PORT,()=>console.log(`Finance app: http://localhost:${PORT}`));
+const PORT=process.env.PORT||3000;app.listen(PORT,()=>console.log(`Finance app: http://localhost:${PORT}`));
