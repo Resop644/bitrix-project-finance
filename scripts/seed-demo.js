@@ -1,7 +1,11 @@
 const Database = require('better-sqlite3');
 const crypto = require('crypto');
-const db = new Database(process.env.DB_FILE || 'finance.db');
+const fs = require('fs');
+const path = require('path');
 
+const dbFile = process.env.DB_FILE || 'finance.db';
+fs.mkdirSync(path.dirname(path.resolve(dbFile)), { recursive: true });
+const db = new Database(dbFile);
 db.pragma('foreign_keys = ON');
 
 function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
@@ -66,5 +70,12 @@ const expense = db.prepare("SELECT COALESCE(SUM(amount),0) v FROM transactions W
 const profit = income - expense;
 const margin = income ? profit / income * 100 : 0;
 
-console.log(`Demo project ready: ${income} income / ${expense} expense / ${profit} profit / ${margin}% margin`);
-console.log('Login: admin@example.com / admin123');
+if (income !== 1000000 || expense !== 500000 || profit !== 500000 || margin !== 50) {
+  console.error('Demo dataset validation failed:', { income, expense, profit, margin });
+  process.exitCode = 1;
+} else {
+  console.log(`Demo project ready: ${income} income / ${expense} expense / ${profit} profit / ${margin}% margin`);
+  console.log('Login: admin@example.com / admin123');
+}
+
+db.close();
