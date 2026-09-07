@@ -4,7 +4,7 @@
   "private": true,
   "description": "Учет доходов и расходов по проектам для Bitrix24",
   "main": "server.js",
-  "scripts": { "start": "node server.js", "dev": "node --watch server.js" },
+  "scripts": { "start": "node server.js", "dev": "node --watch server.js", "test": "node tests/finance.test.js" },
   "engines": { "node": ">=20" },
   "dependencies": { "better-sqlite3": "^11.10.0", "express": "^5.1.0" }
 }
